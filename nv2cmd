@@ -1,0 +1,232 @@
+#!/usr/bin/env python3
+"""
+nv2cmd - NVUE YAML to NV Commands Converter
+
+Product: nv2cmd
+Author: Josh Finlay
+Repo: https://github.com/AthenaNetworks/cumulus-nv2cmd
+
+This script calls 'nv config show' to get the current NVUE configuration in YAML format,
+then translates it into equivalent 'nv' command sets for Cumulus Linux 5+.
+"""
+
+import subprocess
+import yaml
+import sys
+from typing import Dict, List, Any, Optional
+
+
+class NVUECommandGenerator:
+    """Converts NVUE YAML configuration to nv command sets."""
+    
+    def __init__(self):
+        self.commands = []
+    
+    def run_nv_config_show(self) -> str:
+        """Execute 'nv config show' and return YAML output."""
+        try:
+            result = subprocess.run(
+                ['nv', 'config', 'show'],
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            return result.stdout
+        except subprocess.CalledProcessError as e:
+            print(f"Error running 'nv config show': {e}", file=sys.stderr)
+            print(f"stderr: {e.stderr}", file=sys.stderr)
+            sys.exit(1)
+        except FileNotFoundError:
+            print("Error: 'nv' command not found. Make sure you're running on Cumulus Linux 5+", file=sys.stderr)
+            sys.exit(1)
+    
+    def parse_yaml(self, yaml_content: str) -> Dict[str, Any]:
+        """Parse YAML content and return as dictionary."""
+        try:
+            return yaml.safe_load(yaml_content)
+        except yaml.YAMLError as e:
+            print(f"Error parsing YAML: {e}", file=sys.stderr)
+            sys.exit(1)
+    
+    def generate_commands_from_dict(self, data: Dict[str, Any], prefix: str = "nv set") -> None:
+        """Recursively generate nv commands from configuration dictionary."""
+        for key, value in data.items():
+            current_path = f"{prefix} {key}"
+            
+            if isinstance(value, dict):
+                # Handle empty dictionaries (common in NVUE for enabling features)
+                if not value:  # Empty dict like {}
+                    self.commands.append(current_path)
+                elif self._is_leaf_config(value):
+                    # This is a configuration object with properties
+                    self._handle_config_object(current_path, value)
+                else:
+                    # Continue recursing
+                    self.generate_commands_from_dict(value, current_path)
+            elif isinstance(value, list):
+                # Handle lists/arrays
+                self._handle_list_config(current_path, value)
+            else:
+                # Handle simple key-value pairs
+                self.commands.append(f"{current_path} {value}")
+    
+    def _is_leaf_config(self, obj: Dict[str, Any]) -> bool:
+        """Determine if this dictionary represents a configuration leaf node."""
+        # Common patterns that indicate a leaf configuration object
+        leaf_indicators = {
+            'type', 'address', 'prefix', 'vlan', 'bridge', 'bond',
+            'ip', 'ipv4', 'ipv6', 'mtu', 'admin', 'speed', 'duplex',
+            'enable', 'disable', 'state', 'mode', 'protocol'
+        }
+        
+        # If any keys match common config properties, treat as leaf
+        return bool(set(obj.keys()) & leaf_indicators)
+    
+    def _handle_config_object(self, path: str, obj: Dict[str, Any]) -> None:
+        """Handle configuration objects with properties."""
+        for prop, value in obj.items():
+            if isinstance(value, dict):
+                # Nested object within config
+                for sub_prop, sub_value in value.items():
+                    self.commands.append(f"{path} {prop} {sub_prop} {sub_value}")
+            elif isinstance(value, list):
+                # List property
+                for item in value:
+                    self.commands.append(f"{path} {prop} {item}")
+            else:
+                # Simple property
+                self.commands.append(f"{path} {prop} {value}")
+    
+    def _handle_list_config(self, path: str, items: List[Any]) -> None:
+        """Handle list/array configurations."""
+        for item in items:
+            if isinstance(item, dict):
+                # List of configuration objects
+                for key, value in item.items():
+                    if isinstance(value, dict):
+                        self._handle_config_object(f"{path} {key}", value)
+                    else:
+                        self.commands.append(f"{path} {key} {value}")
+            else:
+                # List of simple values
+                self.commands.append(f"{path} {item}")
+    
+    def generate_interface_commands(self, interfaces: Dict[str, Any]) -> None:
+        """Generate commands specifically for interface configurations."""
+        for interface_name, interface_config in interfaces.items():
+            base_cmd = f"nv set interface {interface_name}"
+            
+            if isinstance(interface_config, dict):
+                self._process_interface_config(base_cmd, interface_config)
+    
+    def _process_interface_config(self, base_cmd: str, config: Dict[str, Any]) -> None:
+        """Process interface configuration recursively."""
+        for prop, value in config.items():
+            if isinstance(value, dict):
+                if not value:  # Empty dict like {}
+                    self.commands.append(f"{base_cmd} {prop}")
+                else:
+                    self._process_nested_interface_config(f"{base_cmd} {prop}", value)
+            elif isinstance(value, (str, int, float)):
+                self.commands.append(f"{base_cmd} {prop} {value}")
+    
+    def _process_nested_interface_config(self, path: str, config: Dict[str, Any]) -> None:
+        """Process nested interface configuration."""
+        for key, value in config.items():
+            if isinstance(value, dict):
+                if not value:  # Empty dict
+                    self.commands.append(f"{path} {key}")
+                else:
+                    # Continue nesting
+                    self._process_nested_interface_config(f"{path} {key}", value)
+            elif isinstance(value, (str, int, float)):
+                self.commands.append(f"{path} {key} {value}")
+    
+    def convert_yaml_to_commands(self, yaml_content: str) -> List[str]:
+        """Main method to convert YAML configuration to nv commands."""
+        self.commands = []  # Reset commands list
+        config = self.parse_yaml(yaml_content)
+        
+        if not config:
+            return []
+        
+        # Handle NVUE specific format: list with header and set sections
+        if isinstance(config, list):
+            for item in config:
+                if isinstance(item, dict):
+                    # Look for the 'set' section which contains the actual configuration
+                    if 'set' in item:
+                        self._process_config_dict(item['set'])
+                    elif 'header' in item:
+                        # Skip header section, just log it
+                        print(f"# Configuration from {item['header'].get('model', 'unknown')} running {item['header'].get('version', 'unknown')}", file=sys.stderr)
+                    else:
+                        # Process other dictionary items
+                        self._process_config_dict(item)
+        elif isinstance(config, dict):
+            # Handle direct dictionary format
+            if 'set' in config:
+                self._process_config_dict(config['set'])
+            else:
+                self._process_config_dict(config)
+        else:
+            print(f"Warning: Unexpected config type: {type(config)}", file=sys.stderr)
+        
+        return self.commands
+    
+    def _process_config_dict(self, config: Dict[str, Any]) -> None:
+        """Process a configuration dictionary."""
+        # Handle different top-level configuration sections
+        for section, section_config in config.items():
+            if section == "interface":
+                # Special handling for interfaces
+                self.generate_interface_commands(section_config)
+            elif section in ["system", "service", "router", "vrf", "bridge", "mlag"]:
+                # Handle other major configuration sections
+                self.generate_commands_from_dict(section_config, f"nv set {section}")
+            else:
+                # Generic handling for other sections
+                self.generate_commands_from_dict(section_config, f"nv set {section}")
+    
+    def print_commands(self, commands: List[str]) -> None:
+        """Print the generated commands."""
+        if not commands:
+            print("No commands generated.")
+            return
+        
+        # Print header with product information
+        print("#" + "=" * 60)
+        print("# product: nv2cmd")
+        print("# author: Josh Finlay")
+        print("# repo: https://github.com/AthenaNetworks/cumulus-nv2cmd")
+        print("#" + "=" * 60)
+        print("# Generated NVUE Commands")
+        print("# Run these commands to recreate the current configuration")
+        print("#" + "=" * 60)
+        print()
+        
+        for cmd in commands:
+            print(cmd)
+        
+        print()
+        print(f"# Total commands: {len(commands)}")
+
+
+def main():
+    """Main function."""
+    generator = NVUECommandGenerator()
+    
+    # Get current NVUE configuration
+    print("Fetching current NVUE configuration...", file=sys.stderr)
+    yaml_content = generator.run_nv_config_show()
+    
+    # Convert to commands
+    print("Converting YAML to nv commands...", file=sys.stderr)
+    commands = generator.convert_yaml_to_commands(yaml_content)
+    
+    # Output the commands
+    generator.print_commands(commands)
+
+
+if __name__ == "__main__":
+    main()
